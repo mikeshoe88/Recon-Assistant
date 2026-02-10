@@ -3,6 +3,19 @@
 //  - When bot joins a recon channel (name contains "rcn"), invite required users
 //  - Reaction ✅ on a message posts that message to the Pipedrive deal as a note
 //  - Deal inferred from channel name "deal###"
+//  - (Optional) Re-upload Slack-attached files into the channel/thread as true Slack documents
+//
+// IMPORTANT NOTES:
+//  1) To resolve Slack user IDs into human names, the app MUST have OAuth scope: users:read
+//     and you MUST reinstall the app after adding scopes.
+//  2) To upload files, the app MUST have: files:write and you MUST reinstall the app.
+//
+// ENV toggles:
+//  ENABLE_REACTION_TO_PD_NOTE=true|false
+//  REACTION_UPLOAD_FILES=true|false            -> uploads attachments to Pipedrive
+//  REACTION_REPOST_FILES_TO_SLACK=true|false   -> re-uploads attachments back to Slack as files (documents)
+//  REPOST_FILES_TARGET=thread|channel          -> upload into thread (default) or channel root
+//  RECON_CHANNEL_REGEX=rcn                     -> recon channel detection
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -37,6 +50,11 @@ const ENABLE_REACTION_TO_PD_NOTE =
 
 const REACTION_UPLOAD_FILES =
   (process.env.REACTION_UPLOAD_FILES || "false") === "true";
+
+const REACTION_REPOST_FILES_TO_SLACK =
+  (process.env.REACTION_REPOST_FILES_TO_SLACK || "false") === "true";
+
+const REPOST_FILES_TARGET = (process.env.REPOST_FILES_TARGET || "thread").toLowerCase();
 
 // Recon channel detection
 const RECON_CHANNEL_REGEX = new RegExp(
@@ -139,8 +157,43 @@ async function ensureBotInChannel(channelId) {
   if (!channelId) return;
   try {
     await app.client.conversations.join({ channel: channelId });
-  } catch (e) {
+  } catch {
     // ignore
+  }
+}
+
+/* =========================
+   Slack identity helpers (IDs -> names)
+========================= */
+const userNameCache = new Map();
+
+async function slackUserIdToName(client, userId) {
+  if (!userId) return "Unknown";
+  if (userNameCache.has(userId)) return userNameCache.get(userId);
+
+  try {
+    const r = await client.users.info({ user: userId });
+    if (!r?.ok) {
+      userNameCache.set(userId, `User ${userId}`);
+      return `User ${userId}`;
+    }
+
+    const u = r.user;
+    const p = u?.profile;
+    const name =
+      p?.real_name_normalized ||
+      u?.real_name ||
+      p?.display_name ||
+      u?.name ||
+      `User ${userId}`;
+
+    userNameCache.set(userId, name);
+    return name;
+  } catch (e) {
+    // Most common cause: missing_scope (users:read)
+    const fallback = `User ${userId}`;
+    userNameCache.set(userId, fallback);
+    return fallback;
   }
 }
 
@@ -213,7 +266,7 @@ ${message || "(no text)"}${attachmentsBlock}${linkBlock}`;
 }
 
 /* =========================
-   Attachment Download / Upload (Optional)
+   Attachment Download / Upload
 ========================= */
 async function downloadFile(urlPrivateDownload, botToken) {
   const resp = await axios.get(urlPrivateDownload, {
@@ -248,6 +301,41 @@ async function uploadFileToPipedrive(dealId, filePath, filename) {
   });
 
   return resp.data;
+}
+
+// Re-upload a file to Slack as a true document (not a link)
+async function uploadFileToSlack({ botToken, channelId, threadTs, filePath, filename, title }) {
+  const FormData = (await import("form-data")).default;
+
+  const form = new FormData();
+  form.append("channels", channelId);
+  form.append("file", fs.createReadStream(filePath), {
+    filename: filename || path.basename(filePath),
+    contentType: "application/octet-stream",
+  });
+  if (title) form.append("title", title);
+
+  // Upload into thread if requested
+  if (threadTs && REPOST_FILES_TARGET === "thread") {
+    form.append("thread_ts", threadTs);
+  }
+
+  // optional comment
+  form.append("initial_comment", "📎 File uploaded by Recon Assistant");
+
+  const resp = await axios.post("https://slack.com/api/files.upload", form, {
+    headers: {
+      ...form.getHeaders(),
+      Authorization: `Bearer ${botToken}`,
+    },
+  });
+
+  const data = resp.data;
+  if (!data?.ok) {
+    throw new Error(`Slack files.upload failed: ${data?.error || "unknown_error"}`);
+  }
+
+  return data;
 }
 
 /* =========================
@@ -305,7 +393,7 @@ app.event("member_joined_channel", async ({ event }) => {
 });
 
 /* =========================
-   ✅ REACTION → PD NOTE
+   ✅ REACTION → PD NOTE (+ optional file handling)
 ========================= */
 const PD_NOTE_REACTIONS = new Set([
   "white_check_mark",
@@ -356,52 +444,60 @@ app.event("reaction_added", async ({ event, client, context }) => {
     const msg = hist.messages?.[0];
     if (!msg) return;
 
-    const [authorInfo, reactorInfo, linkRes] = await Promise.all([
-      msg.user ? client.users.info({ user: msg.user }).catch(() => null) : null,
-      client.users.info({ user: event.user }).catch(() => null),
+    // Resolve human-readable names (requires users:read)
+    const [authorName, reactorName, linkRes] = await Promise.all([
+      msg.user ? slackUserIdToName(client, msg.user) : Promise.resolve("Unknown"),
+      slackUserIdToName(client, event.user),
       client.chat.getPermalink({ channel: channelId, message_ts: ts }).catch(() => null),
     ]);
-
-    const authorName =
-      authorInfo?.user?.profile?.real_name_normalized ||
-      authorInfo?.user?.real_name ||
-      authorInfo?.user?.profile?.display_name ||
-      authorInfo?.user?.name ||
-      (msg.user ? `User ${msg.user}` : "Unknown");
-
-    const reactorName =
-      reactorInfo?.user?.profile?.real_name_normalized ||
-      reactorInfo?.user?.real_name ||
-      reactorInfo?.user?.profile?.display_name ||
-      reactorInfo?.user?.name ||
-      `User ${event.user}`;
 
     const permalink = linkRes?.permalink;
 
     const attachmentsList = [];
+
+    // Files on the original message
     if (Array.isArray(msg.files) && msg.files.length) {
       for (const f of msg.files) {
         attachmentsList.push(`${f.name} (${f.filetype})`);
       }
 
+      // Optional: upload to Pipedrive
       if (REACTION_UPLOAD_FILES) {
         for (const f of msg.files) {
           try {
-            const tmp = await downloadFile(
-              f.url_private_download,
-              context.botToken
-            );
+            if (!f?.url_private_download) continue;
+            const tmp = await downloadFile(f.url_private_download, context.botToken);
             await uploadFileToPipedrive(dealId, tmp, f.name);
-
-            try {
-              fs.unlinkSync(tmp);
-            } catch {}
+            try { fs.unlinkSync(tmp); } catch {}
           } catch (e) {
-            console.warn(
-              "⚠️ attachment upload failed:",
-              f.name,
-              e?.message || e
-            );
+            console.warn("⚠️ attachment upload to Pipedrive failed:", f?.name, e?.message || e);
+          }
+        }
+      }
+
+      // Optional: Re-upload to Slack as real file(s)
+      // Useful when you want the bot to "send" the PDF as a document (instead of posting only a link)
+      if (REACTION_REPOST_FILES_TO_SLACK) {
+        // Make sure the bot is in the channel (public channels)
+        await ensureBotInChannel(channelId);
+
+        for (const f of msg.files) {
+          try {
+            if (!f?.url_private_download) continue;
+            const tmp = await downloadFile(f.url_private_download, context.botToken);
+
+            await uploadFileToSlack({
+              botToken: context.botToken,
+              channelId,
+              threadTs: ts,
+              filePath: tmp,
+              filename: f.name,
+              title: f.title || f.name,
+            });
+
+            try { fs.unlinkSync(tmp); } catch {}
+          } catch (e) {
+            console.warn("⚠️ re-upload to Slack failed:", f?.name, e?.message || e);
           }
         }
       }
@@ -437,10 +533,7 @@ app.event("reaction_added", async ({ event, client, context }) => {
       });
     }
   } catch (err) {
-    console.error(
-      "❌ reaction_added handler error:",
-      err?.data || err?.message || err
-    );
+    console.error("❌ reaction_added handler error:", err?.data || err?.message || err);
   }
 });
 
