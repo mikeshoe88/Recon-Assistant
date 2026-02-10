@@ -4,21 +4,28 @@
 //  - When bot joins a recon channel (name contains "rcn"), invite required users + PM
 //  - Reaction ✅ on a message posts that message to the Pipedrive deal as a note (deal inferred from channel name "deal###")
 //
-// IMPORTANT:
-//  - For ✅ reaction flow to work, your Slack App MUST have:
-//      Event Subscriptions enabled + bot event: reaction_added
-//      Bot token scopes: reactions:read + channels:history (and/or groups:history for private)
-//  - Code below adds loud DEBUG logging and posts helpful errors back into the thread when scopes/membership are wrong.
+// IMPORTANT (reaction flow requirements):
+//  - Slack App Event Subscriptions: bot event `reaction_added` enabled
+//  - Bot scopes (minimum):
+//      reactions:read
+//      channels:history (public channels)
+//      groups:history (private channels, if you use them)
+//      channels:read / groups:read (for conversations.info)
+//      chat:write
+//  - Bot must be in the channel to read history.
 
 import dotenv from "dotenv";
 dotenv.config();
 
 import express from "express";
-import { App } from "@slack/bolt";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import os from "os";
+
+// ✅ Bolt is CommonJS in your env → import default and destructure
+import pkg from "@slack/bolt";
+const { App } = pkg;
 
 /* =========================
    ENV
@@ -72,7 +79,9 @@ const CORE_INVITE_USER_IDS = [
 ].filter(Boolean);
 
 function getInviteList() {
-  return Array.from(new Set([...ALWAYS_INVITE_USER_IDS, ...CORE_INVITE_USER_IDS]));
+  return Array.from(
+    new Set([...ALWAYS_INVITE_USER_IDS, ...CORE_INVITE_USER_IDS])
+  );
 }
 
 /* =========================
@@ -115,7 +124,6 @@ web.listen(PORT, () => console.log(`🌐 Health server on :${PORT}`));
    Helpers
 ========================= */
 function extractDealIdFromChannelName(channelName = "") {
-  // Looks for "deal123" anywhere in channel name
   const m = String(channelName).match(/deal(\d+)/i);
   return m ? m[1] : null;
 }
@@ -125,7 +133,6 @@ function isReconChannelName(channelName = "") {
 }
 
 function slackErrMessage(err) {
-  // Normalize Slack errors (Bolt wraps Web API errors into err.data sometimes)
   const data = err?.data;
   const code = data?.error || err?.code || err?.message;
   return code || "unknown_error";
@@ -144,9 +151,10 @@ async function safeConversationsInvite(channel, userIds = []) {
       });
       dbg("invited chunk", chunk);
     } catch (e) {
-      const code = slackErrMessage(e);
-      // Common non-fatal errors: already_in_channel, cant_invite_self, not_in_channel
-      dbg("invite error", { code, detail: e?.data || e?.message || e });
+      dbg("invite error", {
+        code: slackErrMessage(e),
+        detail: e?.data || e?.message || e,
+      });
     }
   }
 }
@@ -156,7 +164,6 @@ async function ensureBotInChannel(channelId) {
   try {
     await app.client.conversations.join({ channel: channelId });
   } catch (e) {
-    // Private channels can't be joined via join; must be invited.
     dbg("ensureBotInChannel ignored", slackErrMessage(e));
   }
 }
@@ -190,7 +197,8 @@ function normalizeEnumValue(v) {
   if (typeof v === "string" && /^\d+$/.test(v)) return Number(v);
   if (typeof v === "object" && v.value != null) {
     if (typeof v.value === "number") return v.value;
-    if (typeof v.value === "string" && /^\d+$/.test(v.value)) return Number(v.value);
+    if (typeof v.value === "string" && /^\d+$/.test(v.value))
+      return Number(v.value);
   }
   return null;
 }
@@ -281,8 +289,7 @@ async function handleBotJoinedChannel(channelId) {
     return;
   }
 
-  const inviteIds = getInviteList();
-  await safeConversationsInvite(channelId, inviteIds);
+  await safeConversationsInvite(channelId, getInviteList());
 
   const dealId = extractDealIdFromChannelName(channelName);
   if (!dealId) {
@@ -349,14 +356,12 @@ const PD_NOTE_REACTIONS = new Set([
   "ballot_box_with_check",
 ]);
 
-// Dedupe: channel:ts -> ms
 const noteDedupe = new Map();
 function recentlyNoted(key, ms = 5 * 60 * 1000) {
   const t = noteDedupe.get(key);
   return t && Date.now() - t < ms;
 }
 
-// Optional: file download for attachment upload
 async function downloadFile(urlPrivateDownload, botToken) {
   const resp = await axios.get(urlPrivateDownload, {
     responseType: "arraybuffer",
@@ -414,7 +419,6 @@ async function postThreadHelp(client, channelId, ts, text) {
 }
 
 app.event("reaction_added", async ({ event, client, context }) => {
-  // Loud debug so you can prove whether Slack is even delivering the event
   try {
     dbg("[reaction_added] raw", {
       reaction: event?.reaction,
@@ -423,9 +427,7 @@ app.event("reaction_added", async ({ event, client, context }) => {
       ts: event?.item?.ts,
       item_user: event?.item_user,
     });
-  } catch {}
 
-  try {
     if (!ENABLE_REACTION_TO_PD_NOTE) return;
 
     const channelId = event.item?.channel;
@@ -437,7 +439,6 @@ app.event("reaction_added", async ({ event, client, context }) => {
     const cacheKey = `${channelId}:${ts}`;
     if (recentlyNoted(cacheKey)) return;
 
-    // Get channel info (requires channels:read / groups:read depending on type)
     let channelName = "";
     try {
       const ch = await client.conversations.info({ channel: channelId });
@@ -466,7 +467,6 @@ app.event("reaction_added", async ({ event, client, context }) => {
       return;
     }
 
-    // Fetch the exact message
     let msg = null;
     try {
       const hist = await client.conversations.history({
@@ -509,10 +509,10 @@ app.event("reaction_added", async ({ event, client, context }) => {
 
     const permalink = linkRes?.permalink;
 
-    // Attachments (optional upload)
     const attachmentsList = [];
     if (Array.isArray(msg.files) && msg.files.length) {
-      for (const f of msg.files) attachmentsList.push(`${f.name} (${f.filetype})`);
+      for (const f of msg.files)
+        attachmentsList.push(`${f.name} (${f.filetype})`);
 
       if (REACTION_UPLOAD_FILES) {
         for (const f of msg.files) {
@@ -545,7 +545,6 @@ app.event("reaction_added", async ({ event, client, context }) => {
       attachmentsList,
     });
 
-    // Post note to Pipedrive
     try {
       const noteRes = await pdPost("notes", {
         deal_id: Number(dealId),
@@ -555,7 +554,6 @@ app.event("reaction_added", async ({ event, client, context }) => {
       if (noteRes?.success) {
         noteDedupe.set(cacheKey, Date.now());
 
-        // Add ✅ reaction back (best-effort)
         await client.reactions
           .add({ channel: channelId, name: "white_check_mark", timestamp: ts })
           .catch(() => {});
@@ -575,9 +573,10 @@ app.event("reaction_added", async ({ event, client, context }) => {
         );
       }
     } catch (e) {
-      const msg = e?.response?.data
-        ? JSON.stringify(e.response.data).slice(0, 800)
-        : e?.message || String(e);
+      const msg =
+        e?.response?.data
+          ? JSON.stringify(e.response.data).slice(0, 800)
+          : e?.message || String(e);
 
       await postThreadHelp(
         client,
@@ -588,7 +587,10 @@ app.event("reaction_added", async ({ event, client, context }) => {
       return;
     }
   } catch (err) {
-    console.error("❌ reaction_added handler error:", err?.data || err?.message || err);
+    console.error(
+      "❌ reaction_added handler error:",
+      err?.data || err?.message || err
+    );
   }
 });
 
