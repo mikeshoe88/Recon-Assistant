@@ -1,308 +1,470 @@
-// index.js (ESM) — Computron Recon core (auto-start + auto-invite + PD Slack URL writeback)
-//
-// ✅ What this does (core-only):
-// 1) When Computron BOT joins a recon channel named like: rcn-<anything>-deal###
-//    - invites Ariel + Ryan + Lamar (always)
-//    - (optional) invites the PM based on the Pipedrive "Project Manager" custom field value
-//    - writes the Slack channel permalink into the Pipedrive "Slack URL" deal custom field
-//    - posts a short “Recon started” message in the channel
-//
-// --------------------
-// REQUIRED ENV VARS (Railway Variables)
-// --------------------
-// SLACK_APP_TOKEN= xapp-...
-// SLACK_BOT_TOKEN= xoxb-...
-// SLACK_SIGNING_SECRET= (not used in socket mode, but safe to include)
-// PIPEDRIVE_API_TOKEN= ...
-// BASE_URL= https://<your-railway-app>.up.railway.app  (optional; only for health/info)
-//
-// --------------------
-// Pipedrive field keys (from your payload)
-// --------------------
-// Project Manager field key: 98c305112b26675e9b22748fae8cb7a274e4d8e7
-// Slack URL field key:       0cc683d3e270d0676aa9d00e38f6a96179de7fc2
-//
-// NOTE: Do NOT hardcode tokens in code. Put them in Railway Variables.
+// index.js (ESM) — Recon Assistant (Socket Mode)
+// Core features:
+//  - When bot joins a recon channel (name contains "rcn"), invite required users + PM
+//  - Reaction ✅ on a message posts that message to the Pipedrive deal as a note (deal inferred from channel name "deal###")
 
 import dotenv from "dotenv";
 dotenv.config();
 
+import express from "express";
 import bolt from "@slack/bolt";
-const { App } = bolt;
-
-import fetch from "node-fetch";
+import axios from "axios";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 /* =========================
-   ENV / CONSTANTS
+   ENV
 ========================= */
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN;   // xapp-...
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;   // xoxb-...
+// Slack
+const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN;         // xapp-...
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;         // xoxb-...
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || "unused_in_socket_mode";
 
+// Pipedrive
 const PIPEDRIVE_API_TOKEN = process.env.PIPEDRIVE_API_TOKEN;
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-// Pipedrive custom field keys (from your deal fields payload)
-const PD_PROJECT_MANAGER_FIELD_KEY =
-  process.env.PD_PROJECT_MANAGER_FIELD_KEY || "98c305112b26675e9b22748fae8cb7a274e4d8e7";
+// Optional feature toggles
+const ENABLE_REACTION_TO_PD_NOTE = (process.env.ENABLE_REACTION_TO_PD_NOTE || "true") !== "false";
+const REACTION_UPLOAD_FILES = (process.env.REACTION_UPLOAD_FILES || "false") === "true";
 
-const PD_SLACK_URL_FIELD_KEY =
-  process.env.PD_SLACK_URL_FIELD_KEY || "0cc683d3e270d0676aa9d00e38f6a96179de7fc2";
+// Recon channel detection
+// You said recon channels will be like "...rcn..." (prefix/suffix doesn’t matter) and includes deal id in name.
+const RECON_CHANNEL_REGEX = new RegExp(process.env.RECON_CHANNEL_REGEX || "rcn", "i"); // default: contains "rcn"
 
-// Always invite these 3 to EVERY recon channel (your instruction)
-const ALWAYS_INVITE_RECON_USER_IDS = [
+// Pipedrive “Project Manager” custom field key (40-hex key)
+// Put your real PM field key in Railway variables as PM_FIELD_KEY.
+// If you don’t know it yet, leave it blank and we’ll fall back to probing on the deal payload.
+const PM_FIELD_KEY = process.env.PM_FIELD_KEY || "";
+
+/* =========================
+   ALWAYS INVITE
+   (you requested Ariel, Ryan, Lamar ALWAYS on recon channels)
+========================= */
+const ALWAYS_INVITE_USER_IDS = [
   "U09PUG47MAM", // Ariel
   "U05G8MQ54JD", // Ryan
   "U086RE5K3LY", // Lamar
 ];
 
-// Project Manager enum option IDs -> Slack user IDs
-// From your Project Manager field "options":
-// 62 Ryan, 63 Shoemaker, 64 PM1, ... 71 PM8
-//
-// Fill in the Slack IDs as you learn them.
-const RECON_PM_ENUM_TO_SLACK = {
-  62: "U05G8MQ54JD", // Ryan
-  63: "U05FPCPHJG6", // Shoemaker (Mike)  <-- adjust if you want a different Slack user id
-  // 64: "UXXXXXXXXXXX", // PM1
-  // 65: "UXXXXXXXXXXX", // PM2
-  // ...
+// Optional: your existing “core always invite” list (keep/expand as needed)
+const CORE_INVITE_USER_IDS = [
+  // "U07AB7A4UNS", // Anastacio
+  // "U0A7S1K86CX", // Lana
+  // "U05FYG3EMHS", // Kim
+  // "U06DKJ1BJ9W", // Danica
+  // "U05FPCPHJG6", // Mike
+].filter(Boolean);
+
+// Final invite set = REQUIRED + CORE
+function getInviteList() {
+  return Array.from(new Set([...ALWAYS_INVITE_USER_IDS, ...CORE_INVITE_USER_IDS]));
+}
+
+/* =========================
+   PM MAPPING (Pipedrive enum ID -> Slack user ID)
+   You asked: "keys + IDs + what they're referencing".
+   This is the structure you want.
+
+   Put your REAL mappings here once you confirm the PM enum IDs.
+========================= */
+const PM_ENUM_ID_TO_NAME = {
+  // Example:
+  // 101: "Johnathan",
+  // 102: "Pena",
+  // 103: "Hector",
+};
+
+const PM_ENUM_ID_TO_SLACK = {
+  // Example:
+  // 101: "U0XXXXXXX", // Johnathan
+  // 102: "U0YYYYYYY", // Pena
+  // 103: "U05TUQ48UBU", // Hector
 };
 
 /* =========================
    Slack App (Socket Mode)
 ========================= */
-if (!SLACK_APP_TOKEN) throw new Error("Missing SLACK_APP_TOKEN (xapp-...)");
-if (!SLACK_BOT_TOKEN) throw new Error("Missing SLACK_BOT_TOKEN (xoxb-...)");
-if (!PIPEDRIVE_API_TOKEN) throw new Error("Missing PIPEDRIVE_API_TOKEN");
+if (!SLACK_APP_TOKEN || !SLACK_BOT_TOKEN) {
+  console.error("❌ Missing SLACK_APP_TOKEN (xapp-...) or SLACK_BOT_TOKEN (xoxb-...). Set Railway Variables.");
+  process.exit(1);
+}
+
+const { App } = bolt;
 
 const app = new App({
   token: SLACK_BOT_TOKEN,
+  appToken: SLACK_APP_TOKEN,
   signingSecret: SLACK_SIGNING_SECRET,
   socketMode: true,
-  appToken: SLACK_APP_TOKEN,
 });
+
+/* =========================
+   Small web server for Railway health checks
+========================= */
+const web = express();
+web.get("/", (_req, res) => res.status(200).send("Recon Assistant OK"));
+web.get("/healthz", (_req, res) => res.status(200).send("ok"));
+web.listen(PORT, () => console.log(`🌐 Health server on :${PORT}`));
 
 /* =========================
    Helpers
 ========================= */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DEBUG = (process.env.DEBUG || "false") === "true";
+const dbg = (...args) => DEBUG && console.log("[DBG]", ...args);
 
-function isReconChannelName(name = "") {
-  return String(name).toLowerCase().startsWith("rcn-");
-}
-
-// expects deal### somewhere in the channel name
-function extractDealIdFromChannelName(name = "") {
-  const m = String(name).toLowerCase().match(/deal(\d+)\b/);
+function extractDealIdFromChannelName(channelName = "") {
+  // Looks for "deal123" anywhere in channel name
+  const m = String(channelName).match(/deal(\d+)/i);
   return m ? m[1] : null;
 }
 
-// Invite users; ignore common invite errors (already_in_channel, cant_invite_self, etc.)
-async function inviteUsersToChannel(client, channelId, userIds = []) {
-  const users = [...new Set(userIds.filter(Boolean))];
-  if (!channelId || !users.length) return;
+function isReconChannelName(channelName = "") {
+  return RECON_CHANNEL_REGEX.test(channelName);
+}
 
-  try {
-    await client.conversations.invite({
-      channel: channelId,
-      users: users.join(","),
-    });
-  } catch (e) {
-    const err = e?.data?.error || e?.message || String(e);
-    // benign cases
-    if (
-      err.includes("already_in_channel") ||
-      err.includes("cant_invite_self") ||
-      err.includes("not_in_channel") ||
-      err.includes("not_supported") ||
-      err.includes("failed_for_some_users")
-    ) {
-      console.log("[inviteUsersToChannel] non-fatal:", err);
-      return;
+async function safeConversationsInvite(channel, userIds = []) {
+  if (!channel || !userIds.length) return;
+  // Slack API limit: up to 1000 users, but practical is smaller.
+  // Invite in chunks of 30 to be safe.
+  const chunkSize = 30;
+  for (let i = 0; i < userIds.length; i += chunkSize) {
+    const chunk = userIds.slice(i, i + chunkSize);
+    try {
+      await app.client.conversations.invite({
+        channel,
+        users: chunk.join(","),
+      });
+      dbg("invited chunk", chunk);
+    } catch (e) {
+      // Common non-fatal errors: already_in_channel, cant_invite_self, not_in_channel
+      dbg("invite error", e?.data || e?.message || e);
     }
-    console.log("[inviteUsersToChannel] error:", err);
   }
 }
 
-// Ensure bot is in channel (join)
-async function ensureBotInChannel(client, channelId) {
+async function ensureBotInChannel(channelId) {
+  if (!channelId) return;
   try {
-    await client.conversations.join({ channel: channelId });
+    await app.client.conversations.join({ channel: channelId });
   } catch (e) {
-    // ignore (private channels, already_in_channel, etc.)
+    // ignore (already in channel / can't join private, etc.)
   }
 }
 
 /* =========================
    Pipedrive helpers
 ========================= */
-async function pdGetDeal(dealId) {
-  const url = `https://api.pipedrive.com/v1/deals/${encodeURIComponent(
-    dealId
-  )}?return_field_key=1&api_token=${encodeURIComponent(PIPEDRIVE_API_TOKEN)}`;
-
-  const resp = await fetch(url);
-  const json = await resp.json();
-  if (!json?.success) throw new Error(`PD deal fetch failed: ${JSON.stringify(json)}`);
-  return json.data;
+async function pdGet(url) {
+  if (!PIPEDRIVE_API_TOKEN) throw new Error("Missing PIPEDRIVE_API_TOKEN");
+  const full = `https://api.pipedrive.com/v1/${url}${url.includes("?") ? "&" : "?"}api_token=${encodeURIComponent(PIPEDRIVE_API_TOKEN)}`;
+  const r = await axios.get(full);
+  return r.data;
 }
 
-async function pdUpdateDeal(dealId, payload) {
-  const url = `https://api.pipedrive.com/v1/deals/${encodeURIComponent(
-    dealId
-  )}?api_token=${encodeURIComponent(PIPEDRIVE_API_TOKEN)}`;
+async function pdPost(url, payload) {
+  if (!PIPEDRIVE_API_TOKEN) throw new Error("Missing PIPEDRIVE_API_TOKEN");
+  const full = `https://api.pipedrive.com/v1/${url}${url.includes("?") ? "&" : "?"}api_token=${encodeURIComponent(PIPEDRIVE_API_TOKEN)}`;
+  const r = await axios.post(full, payload, { headers: { "Content-Type": "application/json" } });
+  return r.data;
+}
 
-  const resp = await fetch(url, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const json = await resp.json();
-  if (!json?.success) throw new Error(`PD deal update failed: ${JSON.stringify(json)}`);
-  return json.data;
+function normalizeEnumValue(v) {
+  // PD custom field enum values come as number, string, or { value, label }
+  if (v == null) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && /^\d+$/.test(v)) return Number(v);
+  if (typeof v === "object" && v.value != null) {
+    if (typeof v.value === "number") return v.value;
+    if (typeof v.value === "string" && /^\d+$/.test(v.value)) return Number(v.value);
+  }
+  return null;
+}
+
+function probeLikelyPmField(deal) {
+  // If you don’t yet know PM_FIELD_KEY, this tries to find a field shaped like an enum
+  // whose label matches one of your PM names (once you populate PM_ENUM_ID_TO_NAME).
+  const knownNames = new Set(
+    Object.values(PM_ENUM_ID_TO_NAME).map((s) => String(s || "").trim().toLowerCase()).filter(Boolean)
+  );
+  if (!knownNames.size) return null;
+
+  for (const [k, v] of Object.entries(deal || {})) {
+    if (!/^[a-f0-9]{40}$/i.test(k)) continue; // PD custom field keys are 40 hex chars
+    if (v && typeof v === "object" && typeof v.label === "string") {
+      const label = v.label.trim().toLowerCase();
+      if (knownNames.has(label)) return { key: k, value: v };
+    }
+    if (typeof v === "string") {
+      const label = v.trim().toLowerCase();
+      if (knownNames.has(label)) return { key: k, value: v };
+    }
+  }
+  return null;
+}
+
+async function fetchDeal(dealId) {
+  if (!dealId) return null;
+  const j = await pdGet(`deals/${encodeURIComponent(dealId)}?return_field_key=1`);
+  return j?.success ? j.data : null;
+}
+
+function readPmFromDeal(deal) {
+  if (!deal) return { pmEnumId: null, pmName: null, pmFieldKeyUsed: null };
+
+  // 1) Use explicit PM_FIELD_KEY if provided
+  if (PM_FIELD_KEY && deal[PM_FIELD_KEY] != null) {
+    const v = deal[PM_FIELD_KEY];
+    const id = normalizeEnumValue(v);
+    const label = (typeof v === "object" && typeof v.label === "string") ? v.label : null;
+    const pmName = label || (id != null ? PM_ENUM_ID_TO_NAME[id] : null) || (typeof v === "string" ? v : null);
+    return { pmEnumId: id, pmName: pmName || null, pmFieldKeyUsed: PM_FIELD_KEY };
+  }
+
+  // 2) Probe if you haven’t put PM_FIELD_KEY yet
+  const probed = probeLikelyPmField(deal);
+  if (probed) {
+    const v = probed.value;
+    const id = normalizeEnumValue(v);
+    const label = (typeof v === "object" && typeof v.label === "string") ? v.label : null;
+    const pmName = label || (id != null ? PM_ENUM_ID_TO_NAME[id] : null) || (typeof v === "string" ? v : null);
+    return { pmEnumId: id, pmName: pmName || null, pmFieldKeyUsed: probed.key };
+  }
+
+  return { pmEnumId: null, pmName: null, pmFieldKeyUsed: null };
 }
 
 /* =========================
-   Recon “start” workflow
+   BOT JOINED CHANNEL → INVITE EVERYONE + PM
 ========================= */
-async function startReconChannel({ client, channelId, channelName }) {
-  const dealId = extractDealIdFromChannelName(channelName);
-  if (!dealId) {
-    await client.chat.postMessage({
-      channel: channelId,
-      text: "⚠️ Recon channel name must include `deal###` (example: `rcn-smith-deal603`).",
-    });
+let BOT_USER_ID = null;
+
+async function initBotIdentity() {
+  try {
+    const auth = await app.client.auth.test();
+    BOT_USER_ID = auth?.user_id || null;
+    console.log("🤖 Bot user id:", BOT_USER_ID);
+  } catch (e) {
+    console.warn("⚠️ auth.test failed:", e?.data || e?.message || e);
+  }
+}
+
+async function handleBotJoinedChannel(channelId) {
+  await ensureBotInChannel(channelId);
+
+  const info = await app.client.conversations.info({ channel: channelId });
+  const channelName = info?.channel?.name || "";
+  dbg("bot joined channel", { channelId, channelName });
+
+  if (!isReconChannelName(channelName)) {
+    dbg("skip (not recon channel)", channelName);
     return;
   }
 
-  // Always invite baseline recon users
-  await ensureBotInChannel(client, channelId);
-  await sleep(250);
-  await inviteUsersToChannel(client, channelId, ALWAYS_INVITE_RECON_USER_IDS);
+  // Always invite required users
+  const inviteIds = getInviteList();
+  await safeConversationsInvite(channelId, inviteIds);
 
-  // Pull deal, detect PM enum, invite PM (optional)
-  let deal = null;
-  let pmSlack = null;
-  try {
-    deal = await pdGetDeal(dealId);
-
-    const pmVal = deal?.[PD_PROJECT_MANAGER_FIELD_KEY];
-    // enum field may come as number, string, or object with .value
-    const pmEnumId =
-      (pmVal && typeof pmVal === "object" && pmVal.value != null)
-        ? Number(pmVal.value)
-        : (pmVal != null ? Number(pmVal) : null);
-
-    if (pmEnumId && RECON_PM_ENUM_TO_SLACK[pmEnumId]) {
-      pmSlack = RECON_PM_ENUM_TO_SLACK[pmEnumId];
-      await inviteUsersToChannel(client, channelId, [pmSlack]);
-    }
-  } catch (e) {
-    console.log("[startReconChannel] PD fetch/invite PM failed:", e?.message || e);
+  // If channel name includes deal###
+  const dealId = extractDealIdFromChannelName(channelName);
+  if (!dealId) {
+    dbg("no deal id in channel name", channelName);
+    return;
   }
 
-  // Write Slack URL back to Pipedrive (Slack URL field)
+  // Fetch deal → read PM enum → invite PM slack id
   try {
-    const link = await client.chat.getPermalink({
-      channel: channelId,
-      message_ts: (await client.chat.postMessage({
+    const deal = await fetchDeal(dealId);
+    if (!deal) return;
+
+    const { pmEnumId, pmName, pmFieldKeyUsed } = readPmFromDeal(deal);
+    dbg("PM resolved", { dealId, pmEnumId, pmName, pmFieldKeyUsed });
+
+    let pmSlackId = null;
+
+    // Prefer enum-id mapping
+    if (pmEnumId != null && PM_ENUM_ID_TO_SLACK[pmEnumId]) {
+      pmSlackId = PM_ENUM_ID_TO_SLACK[pmEnumId];
+    }
+
+    // If you decide later to map by name, you can add it here
+    // (keeping it strict prevents wrong invites)
+
+    if (pmSlackId) {
+      await safeConversationsInvite(channelId, [pmSlackId]);
+      await app.client.chat.postMessage({
         channel: channelId,
-        text: `✅ Recon channel initialized for deal *${dealId}*.`,
-      }))?.ts,
-    });
-
-    const permalink = link?.permalink || null;
-    if (permalink) {
-      await pdUpdateDeal(dealId, { [PD_SLACK_URL_FIELD_KEY]: permalink });
+        text: `✅ Recon Assistant invited required users + PM (${pmName || "Project Manager"}).`,
+      });
+    } else {
+      await app.client.chat.postMessage({
+        channel: channelId,
+        text:
+          `✅ Recon Assistant invited required users.\n` +
+          `⚠️ PM not auto-invited (no mapping yet). Deal ${dealId}` +
+          (pmName ? ` • PM=${pmName}` : "") +
+          (pmFieldKeyUsed ? ` • field=${pmFieldKeyUsed}` : ""),
+      });
     }
   } catch (e) {
-    console.log("[startReconChannel] PD Slack URL writeback failed:", e?.message || e);
+    console.warn("⚠️ PM invite flow failed:", e?.data || e?.message || e);
   }
-
-  // Final message (clean + quick)
-  const baselineMentions = ALWAYS_INVITE_RECON_USER_IDS.map((id) => `<@${id}>`).join(" ");
-  const pmLine = pmSlack ? `PM invited: <@${pmSlack}>` : "PM invite: (not set / not mapped yet)";
-  await client.chat.postMessage({
-    channel: channelId,
-    text:
-      `🧱 *Recon started*\n` +
-      `• Deal: *${dealId}*\n` +
-      `• Baseline: ${baselineMentions}\n` +
-      `• ${pmLine}\n` +
-      `• Channel format: \`rcn-<name>-deal${dealId}\``,
-  });
 }
 
-/* =========================
-   Events
-========================= */
-
-// This fires when *any* user joins a channel.
-// We only run when the joining user is the BOT itself (Computron).
-app.event("member_joined_channel", async ({ event, client, context }) => {
+/**
+ * NOTE: Slack sends `member_joined_channel` for every user who joins.
+ * We only want when the BOT joins.
+ */
+app.event("member_joined_channel", async ({ event }) => {
   try {
-    const channelId = event.channel;
-    const joiningUser = event.user;
+    if (!BOT_USER_ID) return;
+    if (event?.user !== BOT_USER_ID) return;
+    const channelId = event?.channel;
+    if (!channelId) return;
 
-    // Only trigger when the bot user joins (prevents noise)
-    if (!context?.botUserId || joiningUser !== context.botUserId) return;
-
-    const info = await client.conversations.info({ channel: channelId });
-    const channelName = info?.channel?.name || "";
-
-    if (!isReconChannelName(channelName)) return;
-
-    console.log(`[ReconAutoStart] bot joined #${channelName} (${channelId})`);
-    await startReconChannel({ client, channelId, channelName });
+    await handleBotJoinedChannel(channelId);
   } catch (e) {
-    console.log("[member_joined_channel] error:", e?.data?.error || e?.message || e);
+    console.error("❌ member_joined_channel handler error:", e?.data || e?.message || e);
   }
 });
 
-// Optional: manual command to re-run on demand
-app.command("/recon-start", async ({ ack, body, client }) => {
-  await ack();
-  try {
-    const channelId = body.channel_id;
-    const info = await client.conversations.info({ channel: channelId });
-    const channelName = info?.channel?.name || "";
+/* =========================
+   ✅ REACTION → PD NOTE
+   Mirrors your Computron/Catfish pattern, but trimmed.
+========================= */
+const PD_NOTE_REACTIONS = new Set(["white_check_mark", "heavy_check_mark", "ballot_box_with_check"]);
+const noteDedupe = new Map(); // channel:ts -> ms
+function recentlyNoted(key, ms = 5 * 60 * 1000) {
+  const t = noteDedupe.get(key);
+  return t && Date.now() - t < ms;
+}
 
-    if (!isReconChannelName(channelName)) {
-      await client.chat.postEphemeral({
-        channel: channelId,
-        user: body.user_id,
-        text: "⚠️ This command only works in `rcn-...` channels.",
-      });
+// (optional) file download for attachment upload
+async function downloadFile(urlPrivateDownload, botToken) {
+  const resp = await axios.get(urlPrivateDownload, {
+    responseType: "arraybuffer",
+    headers: { Authorization: `Bearer ${botToken}` },
+  });
+  const tmp = path.join(os.tmpdir(), `slack_${Date.now()}_${Math.random().toString(16).slice(2)}.bin`);
+  fs.writeFileSync(tmp, resp.data);
+  return tmp;
+}
+
+async function uploadFileToPipedrive(dealId, filePath, filename) {
+  // Minimal: use multipart/form-data via axios
+  const FormData = (await import("form-data")).default;
+  const form = new FormData();
+  form.append("deal_id", String(dealId));
+  form.append("file", fs.createReadStream(filePath), { filename: filename || "attachment.bin" });
+
+  const url = `https://api.pipedrive.com/v1/files?api_token=${encodeURIComponent(PIPEDRIVE_API_TOKEN)}`;
+  const resp = await axios.post(url, form, { headers: form.getHeaders() });
+  return resp.data;
+}
+
+function buildNoteFromSlack({ channelName, reactorName, authorName, permalink, text, attachmentsList }) {
+  const filesLine = attachmentsList?.length ? `\n\nAttachments:\n- ${attachmentsList.join("\n- ")}` : "";
+  const linkLine = permalink ? `\n\nSlack link: ${permalink}` : "";
+  return (
+    `Slack note from #${channelName}\n` +
+    `Author: ${authorName}\n` +
+    `Approved by: ${reactorName}\n\n` +
+    `Message:\n${text || "(no text)"}${filesLine}${linkLine}`
+  );
+}
+
+app.event("reaction_added", async ({ event, client, context }) => {
+  try {
+    if (!ENABLE_REACTION_TO_PD_NOTE) return;
+
+    const channelId = event.item?.channel;
+    const ts = event.item?.ts;
+    if (!channelId || !ts) return;
+
+    if (!PD_NOTE_REACTIONS.has(event.reaction)) return;
+
+    const cacheKey = `${channelId}:${ts}`;
+    if (recentlyNoted(cacheKey)) return;
+
+    const ch = await client.conversations.info({ channel: channelId });
+    const channelName = ch.channel?.name || "";
+    const dealId = extractDealIdFromChannelName(channelName);
+
+    if (!dealId) {
+      await client.chat.postMessage({ channel: channelId, thread_ts: ts, text: `⚠️ Channel name must include “deal###”.` });
       return;
     }
 
-    await startReconChannel({ client, channelId, channelName });
-  } catch (e) {
-    console.log("[/recon-start] error:", e?.data?.error || e?.message || e);
+    // Fetch message
+    const hist = await client.conversations.history({ channel: channelId, latest: ts, inclusive: true, limit: 1 });
+    const msg = hist.messages?.[0];
+    if (!msg) return;
+
+    const [authorInfo, reactorInfo, linkRes] = await Promise.all([
+      msg.user ? client.users.info({ user: msg.user }).catch(() => null) : null,
+      client.users.info({ user: event.user }).catch(() => null),
+      client.chat.getPermalink({ channel: channelId, message_ts: ts }).catch(() => null),
+    ]);
+
+    const authorName =
+      authorInfo?.user?.real_name ||
+      authorInfo?.user?.profile?.display_name ||
+      (msg.user ? `<@${msg.user}>` : "unknown");
+
+    const reactorName =
+      reactorInfo?.user?.real_name ||
+      reactorInfo?.user?.profile?.display_name ||
+      `<@${event.user}>`;
+
+    const permalink = linkRes?.permalink;
+
+    // Handle attachments
+    const attachmentsList = [];
+    if (Array.isArray(msg.files) && msg.files.length) {
+      for (const f of msg.files) attachmentsList.push(`${f.name} (${f.filetype})`);
+
+      if (REACTION_UPLOAD_FILES) {
+        for (const f of msg.files) {
+          try {
+            const tmp = await downloadFile(f.url_private_download, context.botToken);
+            await uploadFileToPipedrive(dealId, tmp, f.name);
+            try { fs.unlinkSync(tmp); } catch {}
+          } catch (e) {
+            console.warn("⚠️ attachment upload failed:", f.name, e?.message || e);
+          }
+        }
+      }
+    }
+
+    const content = buildNoteFromSlack({
+      channelName,
+      reactorName,
+      authorName,
+      permalink,
+      text: msg.text || "",
+      attachmentsList,
+    });
+
+    const noteRes = await pdPost("notes", { deal_id: Number(dealId), content });
+    if (noteRes?.success) {
+      noteDedupe.set(cacheKey, Date.now());
+      await client.reactions.add({ channel: channelId, name: "white_check_mark", timestamp: ts }).catch(() => {});
+      await client.chat.postMessage({ channel: channelId, thread_ts: ts, text: `✅ Sent to Pipedrive deal *${dealId}*.` });
+    } else {
+      await client.chat.postMessage({ channel: channelId, thread_ts: ts, text: `⚠️ Failed to send to Pipedrive.` });
+    }
+  } catch (err) {
+    console.error("❌ reaction_added handler error:", err?.data || err?.message || err);
   }
 });
 
 /* =========================
-   Tiny health server (Railway)
-========================= */
-import express from "express";
-const web = express();
-
-web.get("/", (_req, res) => res.status(200).send("Computron Recon OK"));
-web.get("/healthz", (_req, res) => res.status(200).send("ok"));
-
-web.listen(PORT, () => {
-  console.log(`🌐 Web listening on ${PORT} (${BASE_URL})`);
-});
-
-/* =========================
-   Start Slack app
+   Start
 ========================= */
 (async () => {
-  await app.start(); // socket mode doesn't need a port here
-  console.log("✅ Computron Recon (Socket Mode) is running");
+  await initBotIdentity();
+  await app.start(); // Socket Mode ignores PORT for receiving events; web server handles health checks
+  console.log("✅ Recon Assistant running (Socket Mode).");
 })();
-
