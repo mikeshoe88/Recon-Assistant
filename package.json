@@ -1,15 +1,16 @@
 {
   "name": "recon-bot",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@slack/bolt": "^3.17.0",
-    "axios": "^1.6.8",
-    "dotenv": "^16.4.5"
+    "@slack/bolt": "^3.22.0",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "form-data": "^4.0.0"
   }
 }
-
